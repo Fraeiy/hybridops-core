@@ -25,6 +25,8 @@ from .constants import (
 
 AUTHORITY_REF_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 AUTHORITY_TOKEN_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+AUTHORITY_EXPECTED_CHANGE_SET = frozenset({"none", "operation"})
+AUTHORITY_UNVERIFIABLE_ACTION_SET = frozenset({"fail", "record"})
 STEP_KEYS = {
     "id", "module_ref", "execution_profile", "action", "phase", "requires",
     "with_deps", "skip_if_state_ok", "verify_state_on_skip", "retain_on_destroy",
@@ -634,7 +636,12 @@ def validate_blueprint(spec: dict[str, Any], path: Path) -> dict[str, Any]:
         raw_contracts = step.get("contracts")
         if raw_contracts is not None:
             contract_map = as_mapping(raw_contracts, f"steps[{idx}].contracts")
-            allowed = {"addressing_mode", "requires_module_state_ok", "requires_authority"}
+            allowed = {
+                "addressing_mode",
+                "requires_module_state_ok",
+                "requires_authority",
+                "authority_observation",
+            }
             unknown = sorted([str(k) for k in contract_map.keys() if str(k) not in allowed])
             if unknown:
                 raise ValueError(
@@ -709,6 +716,44 @@ def validate_blueprint(spec: dict[str, Any], path: Path) -> dict[str, Any]:
                         )
                     contracts["requires_authority"] = authority
 
+            if "authority_observation" in contract_map:
+                observation = as_mapping(
+                    contract_map.get("authority_observation"),
+                    f"steps[{idx}].contracts.authority_observation",
+                )
+                allowed_observation = {"expected_change", "on_unverifiable"}
+                unknown_observation = sorted(
+                    str(key)
+                    for key in observation
+                    if str(key) not in allowed_observation
+                )
+                if unknown_observation:
+                    raise ValueError(
+                        f"steps[{idx}].contracts.authority_observation has unknown keys: "
+                        f"{', '.join(unknown_observation)}"
+                    )
+                expected_change = as_non_empty_string(
+                    observation.get("expected_change"),
+                    f"steps[{idx}].contracts.authority_observation.expected_change",
+                ).lower()
+                if expected_change not in AUTHORITY_EXPECTED_CHANGE_SET:
+                    raise ValueError(
+                        f"steps[{idx}].contracts.authority_observation.expected_change "
+                        "must be one of: none, operation"
+                    )
+                on_unverifiable = str(
+                    observation.get("on_unverifiable") or "fail"
+                ).strip().lower()
+                if on_unverifiable not in AUTHORITY_UNVERIFIABLE_ACTION_SET:
+                    raise ValueError(
+                        f"steps[{idx}].contracts.authority_observation.on_unverifiable "
+                        "must be one of: fail, record"
+                    )
+                contracts["authority_observation"] = {
+                    "expected_change": expected_change,
+                    "on_unverifiable": on_unverifiable,
+                }
+
         authority_requirement = contracts["requires_authority"]
         if isinstance(authority_requirement, dict):
             logical_ref = authority_requirement["ref"]
@@ -729,6 +774,15 @@ def validate_blueprint(spec: dict[str, Any], path: Path) -> dict[str, Any]:
                 raise ValueError(
                     f"steps[{idx}] requires missing authority binding '{authority_requirement}'"
                 )
+
+        if (
+            "authority_observation" in contracts
+            and not isinstance(authority_requirement, dict)
+            and authority_requirement in {"none", ""}
+        ):
+            raise ValueError(
+                f"steps[{idx}] authority_observation requires an authority binding"
+            )
 
         if contracts["addressing_mode"] == "ipam":
             if not isinstance(authority_requirement, dict) and authority_requirement in {"none", ""}:

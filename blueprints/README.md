@@ -35,6 +35,9 @@ steps:
       requires_authority:
         ref: primary_ipam
         capability: inventory_ipam
+      authority_observation:
+        expected_change: operation
+        on_unverifiable: record
 ```
 
 Provider selection is centralized in the authority registry. Missing, unknown,
@@ -42,11 +45,18 @@ unhealthy, unreachable, stale (when a freshness bound is configured), or
 capability-incompatible bindings fail closed. Successful preflight and
 execution evidence includes a secret-free authority receipt.
 
-NetBox and Nautobot are the two shipped bindings for `inventory_ipam` authority
-enforcement. NetBox retains the existing module-state and optional live API
-behavior. Nautobot checks `/health/` and authenticated access to its IPAM API.
-See the [operation authority contract](../hyops/authority/README.md) for exact
-configuration, provider scope, evidence, and official Nautobot sources.
+`authority_observation` adds a completion gate around the dispatched step. Its
+provider returns the interval verdict, completion freshness basis and detection
+strength. `drifted` and stale completion results fail closed. An
+`unverifiable` result fails by default and may be retained without blocking by
+setting `on_unverifiable: record`. A strict policy is rejected before dispatch
+when its provider cannot establish the required interval evidence.
+
+NetBox and Nautobot provide `inventory_ipam` authority. Kubernetes provides
+`resource_authority` for an exact API object that must remain unchanged across a
+dependent operation. See the
+[operation authority contract](../hyops/authority/README.md) for provider scope,
+configuration and evidence semantics.
 
 ### Completion boundary
 

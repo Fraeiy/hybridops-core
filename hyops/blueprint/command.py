@@ -27,7 +27,11 @@ from typing import Any, Callable
 
 import yaml
 
-from hyops.authority import AuthorityReceipt
+from hyops.authority import (
+    AuthorityIntervalReceipt,
+    AuthorityObservationPolicy,
+    AuthoritySession,
+)
 from hyops.drivers.iac.terragrunt.contracts import get_contract
 from hyops.runtime.browser import is_windows_wsl, open_operator_url
 from hyops.runtime.cost import CostEstimate, format_money
@@ -77,11 +81,13 @@ from .access_session import (
     utc_now,
 )
 from .contracts import (
-    enforce_step_contracts,
+    begin_step_contracts,
+    complete_step_authority,
     explicit_step_inputs_changed,
     module_state_ok,
     module_state_status,
     resolved_step_inputs_file,
+    step_authority_observation_policy,
     step_state_ref,
 )
 from .iol_repair import (
@@ -4915,6 +4921,41 @@ def _run_lab_restore(
     return 0
 
 
+def _authority_completion_receipt(
+    step: dict[str, Any],
+    session: AuthoritySession | None,
+) -> AuthorityIntervalReceipt | None:
+    policy = step_authority_observation_policy(step)
+    if session is None or policy is None:
+        return None
+    completion_floor = datetime.now(timezone.utc).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+    return complete_step_authority(
+        session,
+        policy,
+        completion_floor=completion_floor,
+    )
+
+
+def _authority_admission_evidence(
+    step: dict[str, Any],
+    payload: dict[str, Any],
+    paths,
+    *,
+    observation_policy: AuthorityObservationPolicy | None = None,
+) -> tuple[AuthoritySession | None, dict[str, Any] | None]:
+    session = begin_step_contracts(
+        step,
+        payload,
+        paths,
+        observation_policy=observation_policy,
+    )
+    if not isinstance(session, AuthoritySession):
+        return None, None
+    return session, session.admission.to_evidence()
+
+
 def run_deploy(ns) -> int:
     try:
         payload = _resolve_and_validate(ns)
@@ -5062,6 +5103,30 @@ def run_deploy(ns) -> int:
             )
         return confirm_rc
 
+    env_name = str(getattr(ns, "env", None) or paths.root.name).strip() or "default"
+    record_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", payload["blueprint_ref"])
+    run_id = new_run_id("deploy")
+    logs_dir = getattr(paths, "logs_dir", None)
+    records_authority_interval = any(
+        step_authority_observation_policy(step) is not None
+        for step in payload["steps"]
+    )
+    record_dir = (
+        Path(logs_dir) / "blueprint" / record_token / run_id
+        if logs_dir and records_authority_interval
+        else None
+    )
+    if record_dir is not None:
+        try:
+            record_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"ERR: blueprint deploy failed: authority evidence directory "
+                f"is unavailable: {format_runtime_storage_error(exc)}"
+            )
+            return OPERATOR_ERROR
+    record_writer = EvidenceWriter(record_dir) if record_dir is not None else None
+
     automatic_lab_restore_eligible = _automatic_lab_restore_eligible(payload, paths)
     by_id = {step["id"]: step for step in payload["steps"]}
     fail_fast = bool(payload["policy"].get("fail_fast", True))
@@ -5105,6 +5170,42 @@ def run_deploy(ns) -> int:
             if inputs_file:
                 base["inputs_file"] = str(inputs_file)
 
+        observation_policy = step_authority_observation_policy(step)
+        authority_session: AuthoritySession | None = None
+        if observation_policy is not None:
+            try:
+                authority_session, authority_evidence = _authority_admission_evidence(
+                    step,
+                    payload,
+                    paths,
+                    observation_policy=observation_policy,
+                )
+            except Exception as exc:
+                result = dict(base)
+                result.update(
+                    {"status": "failed", "reason": str(exc), "rc": OPERATOR_ERROR}
+                )
+                if step["optional"]:
+                    result["status"] = "failed-optional"
+                    optional_failures.append(step_id)
+                    step_results.append(result)
+                    print(f"step={step_id} status=failed-optional reason={exc}")
+                    continue
+
+                required_failures.append(step_id)
+                step_results.append(result)
+                print(f"step={step_id} status=failed reason={exc}")
+                if fail_fast:
+                    break
+                continue
+
+            if authority_evidence is not None:
+                base["authority"] = authority_evidence
+            step_preflight_context = dict(preflight_decision)
+            if authority_evidence is not None:
+                step_preflight_context["authority"] = authority_evidence
+            ns.preflight_context = step_preflight_context
+
         if (
             bool(step.get("skip_if_state_ok", False))
             and step["action"] in ("apply", "deploy")
@@ -5119,53 +5220,56 @@ def run_deploy(ns) -> int:
             else:
                 verify_state_on_skip = bool(step.get("verify_state_on_skip", False))
                 if not verify_state_on_skip:
-                    skip_label, skip_detail, skip_item_line = _step_presentation(
-                        step,
-                        state_dir=paths.state_dir,
-                        progress_after=progress_after,
-                    )
-                    result = dict(base)
-                    result.update({"status": "skipped", "reason": "state-ok", "rc": 0})
-                    step_results.append(result)
-                    progress.finish(
-                        step_id,
-                        skip_label,
-                        "skipped",
-                        plain=f"step={step_id} status=skipped reason=state-ok",
-                        detail=f"existing, {skip_detail}",
-                    )
-                    if skip_item_line and progress.enabled:
-                        print(skip_item_line)
-                    continue
-
-                try:
-                    skip_status, skip_detail = _evaluate_step_state_skip(step, paths)
-                except Exception as exc:
-                    skip_status = "error"
-                    skip_detail = f"live state verification failed: {exc}"
+                    skip_status, skip_detail = "safe", ""
+                else:
+                    try:
+                        skip_status, skip_detail = _evaluate_step_state_skip(step, paths)
+                    except Exception as exc:
+                        skip_status = "error"
+                        skip_detail = f"live state verification failed: {exc}"
 
                 if skip_status == "safe":
                     detail = "state-ok"
                     if skip_detail:
                         detail = f"state-ok ({skip_detail})"
-                    presentation_label, presentation_detail, skip_item_line = _step_presentation(
-                        step,
-                        state_dir=paths.state_dir,
-                        progress_after=progress_after,
-                    )
-                    result = dict(base)
-                    result.update({"status": "skipped", "reason": detail, "rc": 0})
-                    step_results.append(result)
-                    progress.finish(
-                        step_id,
-                        presentation_label,
-                        "skipped",
-                        plain=f"step={step_id} status=skipped reason={detail}",
-                        detail=f"existing, {presentation_detail}",
-                    )
-                    if skip_item_line and progress.enabled:
-                        print(skip_item_line)
-                    continue
+                    try:
+                        interval_receipt = _authority_completion_receipt(
+                            step,
+                            authority_session,
+                        )
+                    except Exception as exc:
+                        skip_status = "error"
+                        skip_detail = str(exc)
+                    else:
+                        if interval_receipt is not None:
+                            base["authority_interval"] = interval_receipt.to_evidence()
+                            if interval_receipt.decision == "deny":
+                                skip_status = "error"
+                                skip_detail = (
+                                    "authority continuity gate denied completion: "
+                                    f"{interval_receipt.result}"
+                                )
+                        if skip_status == "safe":
+                            presentation_label, presentation_detail, skip_item_line = (
+                                _step_presentation(
+                                    step,
+                                    state_dir=paths.state_dir,
+                                    progress_after=progress_after,
+                                )
+                            )
+                            result = dict(base)
+                            result.update({"status": "skipped", "reason": detail, "rc": 0})
+                            step_results.append(result)
+                            progress.finish(
+                                step_id,
+                                presentation_label,
+                                "skipped",
+                                plain=f"step={step_id} status=skipped reason={detail}",
+                                detail=f"existing, {presentation_detail}",
+                            )
+                            if skip_item_line and progress.enabled:
+                                print(skip_item_line)
+                            continue
 
                 if skip_status == "error":
                     result = dict(base)
@@ -5195,36 +5299,38 @@ def run_deploy(ns) -> int:
                     drift_detail = f"live-state-drift ({skip_detail})"
                 print(f"step={step_id} status=rerun reason={drift_detail}")
 
-        try:
-            authority_receipt = enforce_step_contracts(step, payload, paths)
-        except Exception as exc:
-            result = dict(base)
-            result.update({"status": "failed", "reason": str(exc), "rc": OPERATOR_ERROR})
-            if step["optional"]:
-                result["status"] = "failed-optional"
-                optional_failures.append(step_id)
+        if observation_policy is None:
+            try:
+                authority_session, authority_evidence = _authority_admission_evidence(
+                    step,
+                    payload,
+                    paths,
+                )
+            except Exception as exc:
+                result = dict(base)
+                result.update(
+                    {"status": "failed", "reason": str(exc), "rc": OPERATOR_ERROR}
+                )
+                if step["optional"]:
+                    result["status"] = "failed-optional"
+                    optional_failures.append(step_id)
+                    step_results.append(result)
+                    print(f"step={step_id} status=failed-optional reason={exc}")
+                    continue
+
+                required_failures.append(step_id)
                 step_results.append(result)
-                print(f"step={step_id} status=failed-optional reason={exc}")
+                print(f"step={step_id} status=failed reason={exc}")
+                if fail_fast:
+                    break
                 continue
 
-            required_failures.append(step_id)
-            step_results.append(result)
-            print(f"step={step_id} status=failed reason={exc}")
-            if fail_fast:
-                break
-            continue
-
-        authority_evidence = (
-            authority_receipt.to_evidence()
-            if isinstance(authority_receipt, AuthorityReceipt)
-            else None
-        )
-        if authority_evidence is not None:
-            base["authority"] = authority_evidence
-        step_preflight_context = dict(preflight_decision)
-        if authority_evidence is not None:
-            step_preflight_context["authority"] = authority_evidence
-        ns.preflight_context = step_preflight_context
+            if authority_evidence is not None:
+                base["authority"] = authority_evidence
+            step_preflight_context = dict(preflight_decision)
+            if authority_evidence is not None:
+                step_preflight_context["authority"] = authority_evidence
+            ns.preflight_context = step_preflight_context
 
         progress.start(
             step_id,
@@ -5320,6 +5426,25 @@ def run_deploy(ns) -> int:
                 if rc != 0 and not err:
                     err = _new_step_failure_detail(step, paths, retry_failure_before)
                 repair_results[-1]["status"] = "ok" if rc == 0 else "retry-failed"
+
+        try:
+            interval_receipt = _authority_completion_receipt(
+                step,
+                authority_session,
+            )
+        except Exception as exc:
+            if rc == 0:
+                rc = OPERATOR_ERROR
+                err = f"authority continuity gate failed: {exc}"
+        else:
+            if interval_receipt is not None:
+                base["authority_interval"] = interval_receipt.to_evidence()
+                if rc == 0 and interval_receipt.decision == "deny":
+                    rc = OPERATOR_ERROR
+                    err = (
+                        "authority continuity gate denied completion: "
+                        f"{interval_receipt.result}"
+                    )
 
         if rc == 0:
             completed_label, completed_detail, item_line = _step_presentation(
@@ -5441,6 +5566,9 @@ def run_deploy(ns) -> int:
         "steps": step_results,
         "preflight_decision": preflight_decision,
     }
+    if record_writer is not None:
+        output["env"] = env_name
+        output["run_id"] = run_id
     if preflight_summary is not None:
         output["preflight"] = preflight_summary
     if repair_results:
@@ -5451,6 +5579,21 @@ def run_deploy(ns) -> int:
         output["next_actions"] = _successful_deploy_actions(ns, payload)
     elif required_failures and _failed_deploy_has_resources(payload, paths):
         output["next_actions"] = {"destroy": _cancelled_deploy_actions(ns, payload)["destroy"]}
+
+    record_file: Path | None = None
+    if record_writer is not None:
+        try:
+            record_file = record_writer.write_json("deploy.json", output)
+        except (OSError, TypeError, ValueError) as exc:
+            if any("authority_interval" in item for item in step_results):
+                required_failures.append("authority_evidence")
+                output["status"] = "failed"
+                output["required_failures"] = required_failures
+                output.pop("next_actions", None)
+                final_status = "failed"
+                print(f"ERR: failed to persist authority evidence: {exc}", file=sys.stderr)
+        else:
+            output["run_record"] = str(record_file)
 
     if json_mode:
         print(json.dumps(output, indent=2, sort_keys=True))
@@ -5492,6 +5635,10 @@ def run_deploy(ns) -> int:
             print(f"  {output['next_actions']['destroy']}")
         elif required_failures:
             _offer_failed_deploy_destroy(ns, payload, paths)
+        if record_file is not None and any(
+            "authority_interval" in item for item in step_results
+        ):
+            print(f"run record: {record_file}")
 
     if cancelled:
         return CANCELLED

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.request import Request
 
-from ..models import AuthorityContext, AuthorityDeclaration, AuthorityEvaluation
+from ..models import (
+    AuthorityContext,
+    AuthorityDeclaration,
+    AuthorityEvaluation,
+    AuthorityIntervalEvaluation,
+    AuthorityObservation,
+    AuthorityObservationPolicy,
+)
 from ._common import (
     config_bool,
     config_positive_number,
@@ -86,7 +95,7 @@ class NautobotAuthorityProvider:
         timeout_s = float(config_positive_number(config, "timeout_s", 5.0) or 5.0)
         verify_tls = config_bool(config, "verify_tls", True)
 
-        health_error, _ = _probe(
+        health_error, _, _ = _probe(
             f"{base_url.rstrip('/')}/health/",
             headers={"Accept": "text/html"},
             timeout_s=timeout_s,
@@ -107,8 +116,9 @@ class NautobotAuthorityProvider:
         api_version = str(config.get("api_version") or "").strip()
         if api_version:
             accept += f"; version={api_version}"
-        api_error, headers = _probe(
-            f"{base_url.rstrip('/')}/api/ipam/prefixes/?limit=1",
+        observation_url = f"{base_url.rstrip('/')}/api/ipam/prefixes/?limit=1"
+        api_error, headers, response_digest = _probe(
+            observation_url,
             headers={"Authorization": f"Token {token}", "Accept": accept},
             timeout_s=timeout_s,
             verify_tls=verify_tls,
@@ -134,6 +144,51 @@ class NautobotAuthorityProvider:
             endpoint=safe_endpoint,
             revision=revision,
             freshness={"checked_at": utc_text(), "source": "live"},
+            observation=AuthorityObservation(
+                token=f"sha256:{response_digest}",
+                observed_at=datetime.now(timezone.utc).isoformat(
+                    timespec="microseconds"
+                ).replace("+00:00", "Z"),
+                scope=observation_url,
+                strength="snapshot",
+                metadata={"source": "authenticated live API read"},
+            ),
+        )
+
+    def interval_verifiable(
+        self,
+        declaration: AuthorityDeclaration,
+        context: AuthorityContext,
+        before: AuthorityObservation,
+        policy: AuthorityObservationPolicy,
+    ) -> bool:
+        del declaration, context, before, policy
+        return False
+
+    def evaluate_interval(
+        self,
+        declaration: AuthorityDeclaration,
+        context: AuthorityContext,
+        before: AuthorityObservation,
+        after: AuthorityObservation,
+        policy: AuthorityObservationPolicy,
+        completion_floor: str,
+    ) -> AuthorityIntervalEvaluation:
+        del declaration, context, completion_floor
+        if policy.expected_change == "none" and before.token != after.token:
+            return AuthorityIntervalEvaluation(
+                interval_status="drifted",
+                completion_status="fresh",
+                result="authority snapshot changed during a no-change interval",
+                detection_strength="snapshot",
+                freshness_basis="authenticated live API read",
+            )
+        return AuthorityIntervalEvaluation(
+            interval_status="unverifiable",
+            completion_status="fresh",
+            result="fresh authority snapshot observed; interval history unavailable",
+            detection_strength="snapshot",
+            freshness_basis="authenticated live API read",
         )
 
 
@@ -145,7 +200,7 @@ def _probe(
     verify_tls: bool,
     product: str,
     expect_paginated_json: bool = False,
-) -> tuple[str, dict[str, str]]:
+) -> tuple[str, dict[str, str], str]:
     request = Request(url, headers=headers, method="GET")
     try:
         with open_no_redirect(
@@ -156,25 +211,32 @@ def _probe(
             code = int(getattr(response, "status", 0) or 0)
             response_headers = dict(getattr(response, "headers", {}) or {})
             if not 200 <= code < 300:
-                return f"{product} returned HTTP {code}", response_headers
+                return f"{product} returned HTTP {code}", response_headers, ""
+            response_digest = ""
             if expect_paginated_json:
                 raw_body = response.read(1_048_577)
                 if len(raw_body) > 1_048_576:
-                    return f"{product} response exceeded 1 MiB", response_headers
+                    return f"{product} response exceeded 1 MiB", response_headers, ""
                 try:
                     payload = json.loads(raw_body)
                 except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-                    return f"{product} returned an invalid JSON response", response_headers
+                    return f"{product} returned an invalid JSON response", response_headers, ""
                 if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-                    return f"{product} returned an unexpected response shape", response_headers
-            return "", response_headers
+                    return f"{product} returned an unexpected response shape", response_headers, ""
+                canonical = json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                response_digest = hashlib.sha256(canonical).hexdigest()
+            return "", response_headers, response_digest
     except HTTPError as exc:
         code = int(getattr(exc, "code", 0) or 0)
         if code in (401, 403):
-            return f"{product} rejected the configured API token (HTTP {code})", {}
-        return f"{product} returned HTTP {code}", {}
+            return f"{product} rejected the configured API token (HTTP {code})", {}, ""
+        return f"{product} returned HTTP {code}", {}, ""
     except URLError as exc:
         reason = str(getattr(exc, "reason", "") or "").strip() or "connection failed"
-        return f"{product} is unreachable ({reason})", {}
+        return f"{product} is unreachable ({reason})", {}, ""
     except Exception:
-        return f"{product} probe failed", {}
+        return f"{product} probe failed", {}, ""

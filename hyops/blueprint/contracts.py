@@ -13,9 +13,12 @@ import yaml
 from hyops.authority import (
     AuthorityContext,
     AuthorityDeclaration,
+    AuthorityIntervalReceipt,
+    AuthorityObservationPolicy,
     AuthorityReceipt,
     AuthorityRequirement,
     AuthorityResolver,
+    AuthoritySession,
     default_authority_registry,
 )
 from hyops.authority.compat import legacy_authority_contract
@@ -228,13 +231,14 @@ def explicit_step_inputs_changed(step: dict[str, Any], payload: dict[str, Any], 
     return True, detail
 
 
-def enforce_step_contracts(
+def begin_step_contracts(
     step: dict[str, Any],
     payload: dict[str, Any],
     paths,
     *,
     assumed_state_ok: set[str] | None = None,
-) -> AuthorityReceipt | None:
+    observation_policy: AuthorityObservationPolicy | None = None,
+) -> AuthoritySession | None:
     contracts = _as_dict(step.get("contracts"))
     policy = _as_dict(payload.get("policy"))
     assumed = set(assumed_state_ok or set())
@@ -306,4 +310,52 @@ def enforce_step_contracts(
         assumed_state_ok=frozenset(assumed),
     )
     resolver = AuthorityResolver(default_authority_registry())
-    return resolver.enforce(requirement, declarations, context)
+    return resolver.begin(
+        requirement,
+        declarations,
+        context,
+        policy=observation_policy,
+    )
+
+
+def enforce_step_contracts(
+    step: dict[str, Any],
+    payload: dict[str, Any],
+    paths,
+    *,
+    assumed_state_ok: set[str] | None = None,
+) -> AuthorityReceipt | None:
+    session = begin_step_contracts(
+        step,
+        payload,
+        paths,
+        assumed_state_ok=assumed_state_ok,
+    )
+    return session.admission if session is not None else None
+
+
+def step_authority_observation_policy(
+    step: dict[str, Any],
+) -> AuthorityObservationPolicy | None:
+    contracts = _as_dict(step.get("contracts"))
+    raw = contracts.get("authority_observation")
+    if not isinstance(raw, dict):
+        return None
+    return AuthorityObservationPolicy(
+        expected_change=str(raw.get("expected_change") or "none").strip().lower(),
+        on_unverifiable=str(raw.get("on_unverifiable") or "fail").strip().lower(),
+    )
+
+
+def complete_step_authority(
+    session: AuthoritySession,
+    policy: AuthorityObservationPolicy,
+    *,
+    completion_floor: str,
+) -> AuthorityIntervalReceipt:
+    resolver = AuthorityResolver(default_authority_registry())
+    return resolver.complete(
+        session,
+        policy,
+        completion_floor=completion_floor,
+    )

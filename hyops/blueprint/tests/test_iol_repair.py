@@ -231,7 +231,7 @@ class IolRepairDeployTest(TestCase):
             patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
             patch("hyops.blueprint.command._automatic_lab_restore_eligible", return_value=False),
             patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
-            patch("hyops.blueprint.command.enforce_step_contracts"),
+            patch("hyops.blueprint.command.begin_step_contracts"),
             patch("hyops.blueprint.command._step_failure_state", return_value=("", "", "")),
             patch("hyops.blueprint.command._new_step_failure_detail", return_value=mismatch),
             patch("hyops.blueprint.command.run_step_module_command", side_effect=[1, 0]) as command,
