@@ -220,8 +220,32 @@
                   "$ref": "#/$defs/authorityRequirement"
                 }
               ]
+            },
+            "authority_observation": {
+              "$ref": "#/$defs/authorityObservation"
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "authority_observation"
+                ]
+              },
+              "then": {
+                "required": [
+                  "requires_authority"
+                ],
+                "properties": {
+                  "requires_authority": {
+                    "not": {
+                      "const": "none"
+                    }
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
@@ -262,6 +286,29 @@
         "capability": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        }
+      }
+    },
+    "authorityObservation": {
+      "type": "object",
+      "required": [
+        "expected_change"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "expected_change": {
+          "type": "string",
+          "enum": [
+            "none",
+            "operation"
+          ]
+        },
+        "on_unverifiable": {
+          "type": "string",
+          "enum": [
+            "fail",
+            "record"
+          ]
         }
       }
     },

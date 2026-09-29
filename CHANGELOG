@@ -24,6 +24,13 @@ This changelog records significant operator-facing capabilities, lifecycle chang
 - Added a provider-neutral operation authority contract with typed logical
   requirements, centralized provider resolution, secret-safe receipts, and
   independently selectable NetBox and Nautobot `inventory_ipam` bindings.
+- Added opt-in authority observations before and after governed blueprint steps,
+  with provider-owned interval comparison, explicit completion freshness and
+  persisted run-record evidence, plus pre-dispatch enforcement of fail-or-record
+  policy for unverifiable intervals.
+- Added Kubernetes `resource_authority` observations using fresh API reads, UID
+  continuity and `resourceVersion` comparison to detect unchanged, replaced,
+  drifted and stale authority state across a dependent operation.
 - Added `hyops show env list` with concise and JSON views of local environment
   readiness, state, initialized targets, blueprint references and last activity.
 

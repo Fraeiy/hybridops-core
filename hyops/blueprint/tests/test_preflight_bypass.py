@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
-from hyops.authority import AuthorityReceipt
+from hyops.authority import (
+    AuthorityContext,
+    AuthorityDeclaration,
+    AuthorityIntervalReceipt,
+    AuthorityReceipt,
+    AuthorityRequirement,
+    AuthoritySession,
+)
 from hyops.blueprint.command import _successful_deploy_actions, run_deploy
-from hyops.runtime.exitcodes import OPERATOR_ERROR
+from hyops.runtime.exitcodes import CANCELLED, OPERATOR_ERROR
 from hyops.runtime.paths import RuntimePaths
 from hyops.runner.command import _remote_blueprint_command
 
@@ -61,6 +69,41 @@ def _namespace(
         restore_labs=False,
         skip_lab_restore=False,
         overwrite_labs=False,
+    )
+
+
+def _authority_session() -> AuthoritySession:
+    return AuthoritySession(
+        requirement=AuthorityRequirement("primary_ipam", "inventory_ipam"),
+        declaration=AuthorityDeclaration(
+            "primary_ipam",
+            "inventory_ipam",
+            "fixture",
+        ),
+        context=AuthorityContext(Path("/tmp"), Path("/tmp/state"), {}),
+        admission=AuthorityReceipt(
+            logical_ref="primary_ipam",
+            capability="inventory_ipam",
+            provider="fixture",
+            state="ready",
+            result="admitted",
+        ),
+    )
+
+
+def _interval_receipt(*, decision: str) -> AuthorityIntervalReceipt:
+    return AuthorityIntervalReceipt(
+        logical_ref="primary_ipam",
+        capability="inventory_ipam",
+        provider="fixture",
+        expected_change="none",
+        on_unverifiable="fail",
+        interval_status="stable" if decision == "allow" else "drifted",
+        completion_status="fresh",
+        decision=decision,
+        result="authority remained stable" if decision == "allow" else "authority drifted",
+        detection_strength="revision-and-audit",
+        freshness_basis="resource revision",
     )
 
 
@@ -127,15 +170,24 @@ class BlueprintPreflightBypassTest(TestCase):
                 patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
                 patch("hyops.blueprint.command.module_state_ok", return_value=False),
                 patch(
-                    "hyops.blueprint.command.enforce_step_contracts",
-                    return_value=AuthorityReceipt(
-                        logical_ref="primary_ipam",
-                        capability="inventory_ipam",
-                        provider="nautobot",
-                        state="ready",
-                        result="admitted",
-                        endpoint="https://nautobot.example",
-                        revision="2.4",
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=AuthoritySession(
+                        requirement=AuthorityRequirement(
+                            "primary_ipam", "inventory_ipam"
+                        ),
+                        declaration=AuthorityDeclaration(
+                            "primary_ipam", "inventory_ipam", "nautobot"
+                        ),
+                        context=AuthorityContext(root, root / "state", {}),
+                        admission=AuthorityReceipt(
+                            logical_ref="primary_ipam",
+                            capability="inventory_ipam",
+                            provider="nautobot",
+                            state="ready",
+                            result="admitted",
+                            endpoint="https://nautobot.example",
+                            revision="2.4",
+                        ),
                     ),
                 ),
                 patch("hyops.blueprint.command.run_step_module_command", side_effect=run_step),
@@ -177,7 +229,7 @@ class BlueprintPreflightBypassTest(TestCase):
                 patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
                 patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
                 patch("hyops.blueprint.command.module_state_ok", return_value=False),
-                patch("hyops.blueprint.command.enforce_step_contracts"),
+                patch("hyops.blueprint.command.begin_step_contracts"),
                 patch("hyops.blueprint.command.run_step_module_command", side_effect=run_step),
             ):
                 rc = run_deploy(
@@ -208,7 +260,7 @@ class BlueprintPreflightBypassTest(TestCase):
                 patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
                 patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
                 patch("hyops.blueprint.command.module_state_ok", return_value=False),
-                patch("hyops.blueprint.command.enforce_step_contracts"),
+                patch("hyops.blueprint.command.begin_step_contracts"),
                 patch("hyops.blueprint.command.run_step_module_command", return_value=2),
                 patch("hyops.blueprint.command._failed_deploy_has_resources", return_value=True),
                 patch("hyops.blueprint.command._offer_failed_deploy_destroy") as cleanup,
@@ -219,6 +271,306 @@ class BlueprintPreflightBypassTest(TestCase):
 
         self.assertEqual(rc, OPERATOR_ERROR)
         cleanup.assert_called_once()
+
+    def test_authority_interval_receipt_is_recorded_after_dispatch(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            ns.json = True
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=False),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command", return_value=0),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="allow"),
+                ) as complete,
+                patch("builtins.print") as output,
+            ):
+                rc = run_deploy(ns)
+
+            rendered = json.loads(output.call_args_list[-1].args[0])
+            persisted = json.loads(
+                Path(rendered["run_record"]).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            rendered["steps"][0]["authority_interval"]["decision"],
+            "allow",
+        )
+        self.assertEqual(
+            persisted["steps"][0]["authority_interval"]["decision"],
+            "allow",
+        )
+        complete.assert_called_once()
+
+    def test_authority_interval_denial_fails_the_step(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            ns.json = True
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=False),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command", return_value=0),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="deny"),
+                ),
+                patch("hyops.blueprint.command._failed_deploy_has_resources", return_value=False),
+                patch("builtins.print") as output,
+            ):
+                rc = run_deploy(ns)
+
+        rendered = json.loads(output.call_args_list[-1].args[0])
+        self.assertEqual(rc, OPERATOR_ERROR)
+        self.assertEqual(
+            rendered["steps"][0]["authority_interval"]["decision"],
+            "deny",
+        )
+
+    def test_failed_dispatch_still_records_closing_authority_observation(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            ns.json = True
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=False),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command", return_value=2),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="allow"),
+                ) as complete,
+                patch("hyops.blueprint.command._failed_deploy_has_resources", return_value=False),
+                patch("builtins.print") as output,
+            ):
+                rc = run_deploy(ns)
+
+        rendered = json.loads(output.call_args_list[-1].args[0])
+        self.assertEqual(rc, OPERATOR_ERROR)
+        self.assertEqual(
+            rendered["steps"][0]["authority_interval"]["decision"],
+            "allow",
+        )
+        complete.assert_called_once()
+
+    def test_cancelled_dispatch_records_closing_authority_observation(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            ns.json = True
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=False),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command", return_value=CANCELLED),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="allow"),
+                ) as complete,
+                patch("builtins.print") as output,
+            ):
+                rc = run_deploy(ns)
+
+        rendered = json.loads(output.call_args_list[-1].args[0])
+        self.assertEqual(rc, CANCELLED)
+        self.assertEqual(
+            rendered["steps"][0]["authority_interval"]["decision"],
+            "allow",
+        )
+        complete.assert_called_once()
+
+    def test_unserializable_authority_evidence_fails_cleanly(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            ns.json = True
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=False),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command", return_value=0),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="allow"),
+                ),
+                patch(
+                    "hyops.blueprint.command.EvidenceWriter.write_json",
+                    side_effect=TypeError("unsupported evidence value"),
+                ),
+                patch("builtins.print") as output,
+            ):
+                rc = run_deploy(ns)
+
+        rendered = json.loads(output.call_args_list[-1].args[0])
+        self.assertEqual(rc, OPERATOR_ERROR)
+        self.assertEqual(rendered["status"], "failed")
+        self.assertIn("authority_evidence", rendered["required_failures"])
+
+    def test_state_skip_cannot_bypass_authority_interval_denial(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["skip_if_state_ok"] = True
+        payload["steps"][0]["contracts"] = {
+            "authority_observation": {
+                "expected_change": "none",
+                "on_unverifiable": "fail",
+            }
+        }
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=True),
+                patch("hyops.blueprint.command.explicit_step_inputs_changed", return_value=(False, "")),
+                patch(
+                    "hyops.blueprint.command.begin_step_contracts",
+                    return_value=_authority_session(),
+                ),
+                patch(
+                    "hyops.blueprint.command.complete_step_authority",
+                    return_value=_interval_receipt(decision="deny"),
+                ),
+                patch("hyops.blueprint.command.run_step_module_command") as command,
+                patch("hyops.blueprint.command._failed_deploy_has_resources", return_value=False),
+            ):
+                rc = run_deploy(ns)
+
+        self.assertEqual(rc, OPERATOR_ERROR)
+        command.assert_not_called()
+
+    def test_existing_state_skip_without_interval_keeps_legacy_path(self) -> None:
+        payload = _payload()
+        payload["steps"][0]["skip_if_state_ok"] = True
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = RuntimePaths.from_root(root)
+            ns = _namespace(root, reason="controlled provider recovery")
+            with (
+                patch("hyops.blueprint.command._resolve_and_validate", return_value=payload),
+                patch("hyops.blueprint.command.require_runtime_selection"),
+                patch("hyops.blueprint.command.resolve_runtime_paths", return_value=paths),
+                patch("hyops.blueprint.command.ensure_layout"),
+                patch("hyops.blueprint.command.require_runtime_writable"),
+                patch("hyops.blueprint.command._enforce_runtime_blueprint_file_scope"),
+                patch("hyops.blueprint.command._confirm_deploy_if_needed", return_value=0),
+                patch("hyops.blueprint.command.resolved_step_inputs_file", return_value=None),
+                patch("hyops.blueprint.command.module_state_ok", return_value=True),
+                patch(
+                    "hyops.blueprint.command.explicit_step_inputs_changed",
+                    return_value=(False, ""),
+                ),
+                patch("hyops.blueprint.command.begin_step_contracts") as admission,
+                patch("hyops.blueprint.command.run_step_module_command") as command,
+            ):
+                rc = run_deploy(ns)
+
+        self.assertEqual(rc, 0)
+        admission.assert_not_called()
+        command.assert_not_called()
 
     def test_runner_forwards_bypass_reason_to_remote_command(self) -> None:
         ns = SimpleNamespace(

@@ -2,7 +2,7 @@
 
 HybridOps separates the authority an operation requires from the product that
 supplies it. A blueprint declares a logical authority and a capability, then
-binds that declaration to one of the shipped providers:
+binds that declaration to a shipped provider:
 
 ```yaml
 authorities:
@@ -26,9 +26,10 @@ admits that capability. Generic blueprint enforcement does not select products.
 
 ## Shipped bindings
 
-Both bindings currently support only `inventory_ipam` authority enforcement.
-This contract establishes whether a dependent operation may proceed; it does
-not claim a general CMDB plugin ecosystem.
+NetBox and Nautobot provide `inventory_ipam` authority. Kubernetes provides
+`resource_authority` for an exact API object used as a cross-system control
+record. The contract establishes whether a dependent operation may proceed; it
+does not replace provider reconciliation.
 
 ### NetBox
 
@@ -93,6 +94,57 @@ authenticated IPAM access, and attributable receipts. It does not add Nautobot
 allocation, inventory import/export, or a Nautobot deployment module; those are
 separate provider lifecycle capabilities.
 
+### Kubernetes
+
+The Kubernetes binding reads one exact API object before and after a dependent
+operation. A fresh API read supplies the completion observation. The object's
+UID and `metadata.resourceVersion` supply interval evidence when the object is
+required to remain unchanged.
+
+```yaml
+authorities:
+  change_control:
+    capability: resource_authority
+    provider: kubernetes
+    config:
+      resource_path: /api/v1/namespaces/platform/configmaps/change-authority
+      endpoint_env: KUBERNETES_API_URL
+      token_env: KUBERNETES_API_TOKEN
+      verify_tls: true
+      timeout_s: 5
+      instance_id: platform-control-plane
+
+steps:
+  - id: dependent_operation
+    module_ref: platform/example/dependent-operation
+    contracts:
+      requires_authority:
+        ref: change_control
+        capability: resource_authority
+      authority_observation:
+        expected_change: none
+        on_unverifiable: fail
+```
+
+`endpoint` may replace `endpoint_env`. The API token remains environment-backed
+and is never written to evidence. The endpoint must be an HTTPS origin; plain
+HTTP is accepted only for loopback testing. `resource_path` must identify one
+object under `/api/` or `/apis/`. TLS verification is enabled by default, and
+redirects are rejected.
+
+For `expected_change: none`, an unchanged UID and `resourceVersion` produce a
+`stable` verdict. A revision change reports `drifted` even when the object's
+content has returned to its original value. Object replacement also reports
+`drifted`. A lower numeric completion revision is stale and fails closed.
+
+The adapter does not claim writer attribution. A strict
+`expected_change: operation` policy is rejected before dispatch because a
+resource revision alone cannot separate the intended write from another actor's
+write.
+
+These semantics follow the Kubernetes API documentation for
+[efficient change detection and resource versions](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes).
+
 ## Fail-closed behavior and evidence
 
 Missing bindings, unknown providers, unsupported or mismatched capabilities,
@@ -104,7 +156,43 @@ An admitted operation records a secret-free authority receipt in preflight and
 module execution evidence. The receipt contains the logical reference,
 capability, provider, verified state, result, safe instance/endpoint identity,
 and available state run ID, update information, or Nautobot `API-Version`.
-Tokens and other credential values are never copied into the receipt.
+Credentials are never copied into the receipt.
+
+## Interval observations
+
+A step can require a second authority observation after successful dispatch:
+
+```yaml
+contracts:
+  requires_authority:
+    ref: primary_ipam
+    capability: inventory_ipam
+  authority_observation:
+    expected_change: operation
+    on_unverifiable: record
+```
+
+`expected_change` is `none` when the governed authority must remain unchanged,
+or `operation` when the dispatched operation may produce an expected change.
+The provider compares its native observations and returns an interval status of
+`stable`, `drifted`, or `unverifiable`. It separately reports whether the
+completion read is fresh. Drift or stale completion evidence always blocks the
+step. `on_unverifiable: record` permits completion while retaining the weaker
+verdict in the step record; the default is `fail`. When the selected provider
+cannot establish the evidence required by `fail`, dispatch is rejected before
+the operation starts.
+
+Observation tokens identify provider state and must not contain credentials.
+`observed_at` records when the authoritative read completed; revision,
+generation or audit semantics remain provider-owned.
+
+Nautobot supplies an authenticated live snapshot at each gate. Its completion
+read is fresh. With `expected_change: none`, a changed snapshot reports
+`drifted` and blocks the step. An unchanged snapshot remains `unverifiable`
+because the binding does not consume audit history. NetBox bindings without
+comparable observations are also `unverifiable`. Kubernetes provides strong
+unchanged-object interval evidence through UID and `resourceVersion`; other
+revision or audit semantics remain inside their provider adapters.
 
 ## Legacy NetBox form
 
