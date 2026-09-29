@@ -1358,6 +1358,21 @@ class AuthoritySchemaTests(unittest.TestCase):
             "properties"
         ]["authority_observation"]
         self.assertEqual(observation["$ref"], "#/$defs/authorityObservation")
+        observation_binding = schema["$defs"]["step"]["properties"]["contracts"][
+            "allOf"
+        ][0]
+        self.assertEqual(
+            observation_binding["if"]["required"],
+            ["authority_observation"],
+        )
+        self.assertEqual(
+            observation_binding["then"]["required"],
+            ["requires_authority"],
+        )
+        self.assertEqual(
+            observation_binding["then"]["properties"]["requires_authority"]["not"],
+            {"const": "none"},
+        )
 
 
 if __name__ == "__main__":

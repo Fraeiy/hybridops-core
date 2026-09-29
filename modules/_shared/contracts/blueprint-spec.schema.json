@@ -224,7 +224,28 @@
             "authority_observation": {
               "$ref": "#/$defs/authorityObservation"
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": [
+                  "authority_observation"
+                ]
+              },
+              "then": {
+                "required": [
+                  "requires_authority"
+                ],
+                "properties": {
+                  "requires_authority": {
+                    "not": {
+                      "const": "none"
+                    }
+                  }
+                }
+              }
+            }
+          ]
         }
       }
     },
