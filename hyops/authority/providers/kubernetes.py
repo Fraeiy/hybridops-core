@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 from collections.abc import Mapping
@@ -217,6 +218,10 @@ def _api_endpoint(raw: str) -> str:
     parsed = urlsplit(token)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Kubernetes endpoint must be an http(s) URL")
+    if parsed.scheme == "http" and not _loopback_host(parsed.hostname):
+        raise ValueError(
+            "Kubernetes endpoint must use https; plain http is allowed only for loopback"
+        )
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError(
             "Kubernetes endpoint must not contain credentials, query parameters, or fragments"
@@ -224,6 +229,15 @@ def _api_endpoint(raw: str) -> str:
     if parsed.path not in {"", "/"}:
         raise ValueError("Kubernetes endpoint must not contain a path")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _loopback_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def _resource_path(config: Mapping[str, Any]) -> str:

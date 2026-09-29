@@ -1034,6 +1034,19 @@ class AuthorityContractTests(unittest.TestCase):
                     _paths(Path(tmp)),
                 )
 
+    def test_kubernetes_rejects_plain_http_for_non_loopback_endpoint(self) -> None:
+        payload = _kubernetes_payload()
+        payload["authorities"]["change_control"]["config"]["endpoint"] = (
+            "http://cluster.example"
+        )
+        with TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(ValueError, "must use https"):
+                enforce_step_contracts(
+                    _kubernetes_step(),
+                    payload,
+                    _paths(Path(tmp)),
+                )
+
     def test_kubernetes_rejects_mismatched_resource_identity(self) -> None:
         resource = json.loads(_kubernetes_resource("101"))
         resource["metadata"]["name"] = "another-authority"

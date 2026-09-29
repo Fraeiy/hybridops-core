@@ -127,9 +127,10 @@ steps:
 ```
 
 `endpoint` may replace `endpoint_env`. The API token remains environment-backed
-and is never written to evidence. The endpoint must be an HTTP(S) origin and
-`resource_path` must identify one object under `/api/` or `/apis/`. TLS
-verification is enabled by default, and redirects are rejected.
+and is never written to evidence. The endpoint must be an HTTPS origin; plain
+HTTP is accepted only for loopback testing. `resource_path` must identify one
+object under `/api/` or `/apis/`. TLS verification is enabled by default, and
+redirects are rejected.
 
 For `expected_change: none`, an unchanged UID and `resourceVersion` produce a
 `stable` verdict. A revision change reports `drifted` even when the object's
@@ -168,7 +169,7 @@ contracts:
     capability: inventory_ipam
   authority_observation:
     expected_change: operation
-    on_unverifiable: fail
+    on_unverifiable: record
 ```
 
 `expected_change` is `none` when the governed authority must remain unchanged,
@@ -186,11 +187,12 @@ Observation tokens identify provider state and must not contain credentials.
 generation or audit semantics remain provider-owned.
 
 Nautobot supplies an authenticated live snapshot at each gate. Its completion
-read is fresh, but the interval remains `unverifiable` because the current
-binding does not consume audit history. NetBox bindings without comparable
-observations are also `unverifiable`. Kubernetes provides strong unchanged-object
-interval evidence through UID and `resourceVersion`; other revision or audit
-semantics remain inside their provider adapters.
+read is fresh. With `expected_change: none`, a changed snapshot reports
+`drifted` and blocks the step. An unchanged snapshot remains `unverifiable`
+because the binding does not consume audit history. NetBox bindings without
+comparable observations are also `unverifiable`. Kubernetes provides strong
+unchanged-object interval evidence through UID and `resourceVersion`; other
+revision or audit semantics remain inside their provider adapters.
 
 ## Legacy NetBox form
 
