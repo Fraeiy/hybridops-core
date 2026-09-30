@@ -145,12 +145,20 @@ class _TeeStream:
 
 
 class PythonCommandEvidence(AbstractContextManager["PythonCommandEvidence"]):
-    def __init__(self, evidence_dir: Path, *, command: str, argv: Sequence[str]) -> None:
+    def __init__(
+        self,
+        evidence_dir: Path,
+        *,
+        command: str,
+        argv: Sequence[str],
+        announce_stderr: bool = False,
+    ) -> None:
         self.evidence_dir = evidence_dir
         self.command = command
         self.argv = list(argv)
         self.started_at = _utc_now()
         self.exit_code = 1
+        self._announce_stderr = announce_stderr
         self._output: IO[str] | None = None
         self._stdout = sys.stdout
         self._stderr = sys.stderr
@@ -177,5 +185,8 @@ class PythonCommandEvidence(AbstractContextManager["PythonCommandEvidence"]):
             started_at=self.started_at,
             exit_code=self.exit_code,
         )
-        print(f"run record: {self.evidence_dir}")
+        print(
+            f"run record: {self.evidence_dir}",
+            file=self._stderr if self._announce_stderr else self._stdout,
+        )
         return False
