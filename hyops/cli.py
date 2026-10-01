@@ -197,7 +197,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"ERR: {format_runtime_storage_error(exc)}", file=sys.stderr)
                 return 2
             evidence_dir = command_evidence_dir(paths.logs_dir, "preflight")
-            with PythonCommandEvidence(evidence_dir, command="preflight", argv=argv) as evidence:
+            with PythonCommandEvidence(
+                evidence_dir,
+                command="preflight",
+                argv=argv,
+                announce_stderr=bool(getattr(ns, "json", False)),
+            ) as evidence:
                 evidence.exit_code = int(ns._handler(ns))
                 return evidence.exit_code
         result = int(ns._handler(ns))
