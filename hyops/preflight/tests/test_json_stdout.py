@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -9,6 +10,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from hyops.cli import build_parser
+from hyops.preflight.command import run
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -60,6 +67,63 @@ class PreflightJsonStdoutTests(unittest.TestCase):
             log = Path(record) / "output.log"
             self.assertTrue(log.is_file(), result.stdout)
             self.assertIn("readiness:gcp", log.read_text(encoding="utf-8"))
+
+    def test_module_diagnostics_do_not_corrupt_json(self) -> None:
+        for status in ("ok", "error", "exception"):
+            with self.subTest(status=status):
+                code, stdout, stderr = self._run_noisy_module(status, json_mode=True)
+                payload = json.loads(stdout)
+                self.assertEqual(payload["ok"], status == "ok")
+                self.assertEqual(payload["code"], code)
+                self.assertEqual(code == 0, status == "ok")
+                self.assertIn("resolving module", stderr)
+                self.assertIn("checking driver", stderr)
+                self.assertNotIn("resolving module", stdout)
+                self.assertNotIn("checking driver", stdout)
+                if status == "exception":
+                    self.assertEqual(payload["module_preflight"]["error"], "driver failed")
+
+    def test_module_diagnostics_stay_on_stdout_in_text_mode(self) -> None:
+        code, stdout, stderr = self._run_noisy_module("ok", json_mode=False)
+        self.assertEqual(code, 0)
+        self.assertIn("resolving module", stdout)
+        self.assertIn("checking driver", stdout)
+        self.assertIn("exit_code=0", stdout)
+        self.assertEqual(stderr, "")
+
+    def _run_noisy_module(self, status: str, *, json_mode: bool) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = SimpleNamespace(
+                execution={"driver": "test/driver"},
+                module_dir=Path(tmp),
+                inputs={},
+                required_credentials=[],
+                outputs_publish=[],
+            )
+
+            def resolve(**kwargs):
+                print("resolving module")
+                return resolved
+
+            def driver(request):
+                print("checking driver")
+                if status == "exception":
+                    raise RuntimeError("driver failed")
+                return {"status": status, "error": "driver failed" if status == "error" else ""}
+
+            argv = ["preflight", "--root", tmp, "--module", "test/module"]
+            if json_mode:
+                argv.append("--json")
+            ns = build_parser().parse_args(argv)
+            with (
+                patch("hyops.preflight.command.resolve_module", side_effect=resolve),
+                patch("hyops.preflight.command.REGISTRY.resolve", return_value=driver),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                code = run(ns)
+        return code, stdout.getvalue(), stderr.getvalue()
 
     def _assert_json_document(self, result: subprocess.CompletedProcess[str]) -> dict:
         self.assertNotIn("run record:", result.stdout, result.stdout)
