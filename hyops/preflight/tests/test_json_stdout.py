@@ -91,6 +91,88 @@ class PreflightJsonStdoutTests(unittest.TestCase):
         self.assertIn("exit_code=0", stdout)
         self.assertEqual(stderr, "")
 
+    def test_driver_child_stdout_does_not_prefix_json(self) -> None:
+        for status in ("ok", "exception"):
+            with self.subTest(status=status):
+                code, stdout, stderr = self._run_child_stdout(status, json_mode=True)
+                payload = json.loads(stdout)
+                self.assertEqual(payload["ok"], status == "ok")
+                self.assertEqual(payload["code"], code)
+                self.assertNotIn("child-stdout-marker", stdout)
+                self.assertIn("child-stdout-marker", stderr)
+                if status == "exception":
+                    self.assertEqual(payload["module_preflight"]["error"], "driver failed")
+
+    def test_driver_child_stdout_stays_on_stdout_in_text_mode(self) -> None:
+        code, stdout, stderr = self._run_child_stdout("ok", json_mode=False)
+        self.assertEqual(code, 0)
+        self.assertIn("child-stdout-marker", stdout)
+        self.assertIn("checking driver", stdout)
+        self.assertIn("exit_code=0", stdout)
+        self.assertNotIn("child-stdout-marker", stderr)
+
+    def _run_child_stdout(self, status: str, *, json_mode: bool) -> tuple[int, str, str]:
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        saved_out = os.dup(1)
+        saved_err = os.dup(2)
+        try:
+            os.dup2(out_write, 1)
+            os.dup2(err_write, 2)
+            os.close(out_write)
+            os.close(err_write)
+            out_write = err_write = -1
+            code = self._invoke_child_driver(status, json_mode=json_mode)
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            os.close(saved_out)
+            os.close(saved_err)
+            if out_write >= 0:
+                os.close(out_write)
+            if err_write >= 0:
+                os.close(err_write)
+        stdout = os.read(out_read, 1_000_000).decode()
+        stderr = os.read(err_read, 1_000_000).decode()
+        os.close(out_read)
+        os.close(err_read)
+        return code, stdout, stderr
+
+    def _invoke_child_driver(self, status: str, *, json_mode: bool) -> int:
+        with tempfile.TemporaryDirectory() as tmp:
+            resolved = SimpleNamespace(
+                execution={"driver": "test/driver"},
+                module_dir=Path(tmp),
+                inputs={},
+                required_credentials=[],
+                outputs_publish=[],
+            )
+
+            def resolve(**kwargs):
+                return resolved
+
+            def driver(request):
+                subprocess.run(
+                    [sys.executable, "-c", "print('child-stdout-marker', flush=True)"],
+                    check=False,
+                )
+                print("checking driver")
+                if status == "exception":
+                    raise RuntimeError("driver failed")
+                return {"status": "ok", "error": ""}
+
+            argv = ["preflight", "--root", tmp, "--module", "test/module"]
+            if json_mode:
+                argv.append("--json")
+            ns = build_parser().parse_args(argv)
+            with (
+                patch("hyops.preflight.command.resolve_module", side_effect=resolve),
+                patch("hyops.preflight.command.REGISTRY.resolve", return_value=driver),
+            ):
+                return run(ns)
+
     def _run_noisy_module(self, status: str, *, json_mode: bool) -> tuple[int, str, str]:
         stdout, stderr = io.StringIO(), io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
