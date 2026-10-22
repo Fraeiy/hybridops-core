@@ -112,6 +112,10 @@ class PreflightJsonStdoutTests(unittest.TestCase):
         self.assertNotIn("child-stdout-marker", stderr)
 
     def _run_child_stdout(self, status: str, *, json_mode: bool) -> tuple[int, str, str]:
+        # unittest shares this process. On a pipe, stdout is block-buffered, so
+        # earlier output is still sitting there until something flushes it.
+        sys.stdout.flush()
+        sys.stderr.flush()
         out_read, out_write = os.pipe()
         err_read, err_write = os.pipe()
         saved_out = os.dup(1)
